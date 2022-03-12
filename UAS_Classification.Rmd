@@ -1,0 +1,195 @@
+---
+title: "Classification of Invasive Vegetation in UAS Imagery"
+author: "Louis Jochems"
+date: "3/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Packages required for classifcation 
+
+```{r libraries}
+library(raster)
+library(randomForest)
+library(rgdal)
+library(sp)
+library(sf)
+library(dismo)
+library(reshape2)
+library(ggplot2)
+library(hyperSpec)
+library(data.table)
+library(caret)
+library(dplyr)
+library(tidyr)
+library(gridExtra)
+library(cowplot)
+library(RColorBrewer)
+library(leaflet)
+library(plyr)
+library(pROC)
+library(plyr)
+library(viridis)
+```
+
+##load, clean and check data
+
+```{r data}
+#CSV with each row as single ground truth point and each column representing
+#each band from UAS imagery. each value represented the extracted band value of
+#the pixel that intersects with the points. 
+data_dsm <- read.csv("AlpenaGT_11cm_DSM.csv")
+head(data_dsm)
+#these point values were extracted from UAS orthomosaics (11cm spatial resolution) that we collected 
+#flying over a wetland in Alpena, MI during summer 2019 
+#train is numeric code of vegetation classes (important for models)
+#x and y coordinates of each point in UTM 
+
+#NOTE: I sampled these values in ArcMap, and exported a csv 
+#we could also do this in R, but it takes longer 
+
+#Subset dataframe and exclude irrelevant columns for this analysis 
+aug_dsm <- subset(data_dsm,
+                   select=-c(X.1,Green7_12,Red7_12,Red.Edge7_12,NIR7_12,
+                             NDVI7_12,DSM7_12,StdVegHeight7_12))
+aug_dsm <- drop_na(aug_dsm)
+
+
+#check how many points we have per class
+nrow(aug_dsm[which(aug_dsm$train==1),]) #64 floating veg. points (class 1)
+nrow(aug_dsm[which(aug_dsm$train==2),]) #103 duckweed points (class 2) 
+nrow(aug_dsm[which(aug_dsm$train==3),]) #66 submergent veg. points (class 3)
+nrow(aug_dsm[which(aug_dsm$train==4),]) #82 emergent veg. points (class 4)
+
+```
+
+Prior to classification, it is benefical to inspect the average band values to verify any expected
+spectral and structural differences across vegetation classes while collecting ground truth data in the field. 
+Here's the code to inspect these differences, or spectral profiles, for each vegetation class in the dataset.
+
+```{r spectral profiles}
+aug_prof_features <- reshape2::melt(aug_dsm,id=c("train"),
+                         measure=c("Green8_5","Red8_5","Red.Edge8_5","NIR8_5","NDVI8_5","DSM8_5","StdVegHeight8_5"))
+names(aug_prof_features)[3] <- "Reflectance"
+
+#average 
+aug_avg<-reshape2::dcast(aug_prof_features,train+variable~.,fun=mean, value.var="Reflectance",na.rm=TRUE)
+names(aug_avg)[3]<-"mean_ref"
+#se
+aug_se<-reshape2::dcast(aug_prof_features, train+variable~., fun=sd, value.var="Reflectance",na.rm=TRUE)
+names(aug_se)[3]<-"sd"
+table(aug_dsm$train)#order of classes for below command 
+
+#first reps is train sample n, second is reps are for band #'s (4 classes with varying n, now 7 bands in aug data)
+#numerical order, (efb,yv,sv,emergent)
+Class_length<-c(rep(64,7),rep(103,7),rep(66,7),rep(82,7))
+as.data.frame(Class_length)
+aug_se$class_n<-Class_length
+
+aug_se$se <- aug_se$sd/sqrt(aug_se$class_n)
+aug_spectra <- merge(aug_avg, aug_se, by=c("train","variable"), na.rm=TRUE)
+aug_spectra$lowerse <- aug_spectra$mean_ref-aug_spectra$se
+aug_spectra$upperse <- aug_spectra$mean_ref+aug_spectra$se
+
+aug_spectra$train <- as.factor(aug_spectra$train)
+
+aug_spectra$train <- if_else(aug_spectra$train == 1, "EFB + Lily spp.", as.character(aug_spectra$train))
+aug_spectra$train <- if_else(aug_spectra$train == 2, "Duckweed spp.", as.character(aug_spectra$train))
+aug_spectra$train <- if_else(aug_spectra$train == 3, "Sub.Veg.", as.character(aug_spectra$train))
+aug_spectra$train <- if_else(aug_spectra$train == 4, "Emergent Veg.", as.character(aug_spectra$train))
+
+august_wlegend <- ggplot(aug_spectra,aes(x=variable,y=mean_ref,group=train,color=train)) +
+  geom_line(size=1.25)+
+  geom_errorbar(aes(ymin=lowerse,ymax=upperse,width=0.05))+
+  ylab("Reflectance Value")+
+  xlab("Band Name")+
+  ggtitle("Veg. Classes Spectral/Textural Profiles in Alpena, MI, August 2019")+
+  theme_bw()+
+  theme(axis.title.x = element_text(size = 14, face = "bold")) +
+  scale_x_discrete(labels=c("Green","Red","Red Edge","NIR","NDVI","StdVegHeight"))
+
+#Spectral plot 
+aug_spectra_only <- subset(aug_spectra, variable !="DSM8_5") 
+aug_spectra_only <- subset(aug_spectra_only, variable !="StdVegHeight8_5") 
+
+aug_spectra_only$train <- factor(aug_spectra_only$train,
+                                 levels = c("EFB + Lily spp.","Duckweed spp.","Sub.Veg.","Emergent Veg."))
+
+aug_spectra_plot <- ggplot(aug_spectra_only,aes(x=variable,y=mean_ref,group=train,color=train)) +
+  scale_color_viridis(discrete = TRUE,direction=-1) + 
+  geom_line(size=1.25)+
+  geom_errorbar(aes(ymin=lowerse,ymax=upperse,width=0.05))+
+  ylab("% Reflectance")+
+  theme_bw()+
+  theme(legend.position='none',
+        axis.title.x = element_blank(),panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  scale_x_discrete(labels=c("Green","Red","Red Edge","NIR","NDVI"))
+
+#Rugosity metric (variability in vegetation height around each point)
+aug_rugosity <- subset(aug_spectra, variable == "StdVegHeight8_5")
+aug_rugosity$train <- factor(aug_rugosity$train,
+                                 levels = c("Duckweed spp.","EFB + Lily spp.","Sub.Veg.","Emergent Veg."))
+
+aug_surf_rug_plot <- ggplot(aug_rugosity,aes(x=variable,y=mean_ref,fill=train)) +
+  scale_fill_viridis(discrete = "TRUE",direction=-1,
+                     labels = c("Duckweed spp.","EFB + Lily spp.","Emergent Veg.","Sub. Veg.")) + 
+  geom_bar(position="dodge",stat="identity") +
+  geom_errorbar(aes(ymin=lowerse,ymax=upperse,width=0.2), 
+                position=position_dodge(0.9)) +
+  ylab("SD of Surface Height (m)")+
+  theme_bw()+
+  theme(legend.position='none',
+        axis.title.x=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  scale_x_discrete(labels=c("Rugosity"))
+
+#Surface height (essentially canopy height in our UAS data)
+aug_surface <- subset(aug_spectra, variable == "DSM8_5")
+aug_surface$train <- factor(aug_surface$train,
+                             levels = c("Duckweed spp.","EFB + Lily spp.","Sub.Veg.","Emergent Veg."))
+
+aug_surf_plot <- ggplot(aug_surface,aes(x=variable,y=mean_ref,fill=train)) +
+  scale_fill_viridis(discrete = "TRUE",direction=-1) + 
+  geom_bar(position="dodge",stat="identity") +
+  geom_errorbar(aes(ymin=lowerse,ymax=upperse,width=0.2), 
+                position=position_dodge(0.9)) +
+  ylab("Surface Height (m)") +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(fill="Veg. Class") +
+  coord_cartesian(ylim=c(178.5,179.5)) +
+  scale_x_discrete(labels=c("DSM"))
+
+#grid to put all plots together 
+aug_grid <- grid.arrange(aug_spectra_plot,aug_surf_rug_plot,aug_surf_plot,ncol=3)
+```
+
+We can see pretty good separability (non-overlapping error bars bw class means) for certain bands across most classes. The two classes that are indistinguishable for many bands are the Duckweed class, and European Frogbit/Lily class. These may make sense given that all species in these classes are of the same plant functional group (floating lilies), thus it is not surprising that these classes share similar means given their structural similarity. 
+
+Let's 'lump' together these two classes into a broader 'Floating Vegetation' class. This will enable the machine learning algorithm to better detect differences in these band values for the Floating class vs. the other two vegetation classes, leading to less classifier confusion and higher classifcation accuracy. 
+
+``` {r data prep}
+aug_dsm <- read.csv("AlpenaGT_11cm_DSM.csv")
+aug_dsm$train <- if_else(aug_dsm$train == 2, 1, 
+                         as.double(aug_dsm$train))
+
+#take out a good random portion of floating, way too many
+(floatingindex <- which(aug_dsm$train == '1'))
+(deleteindex <- sample(floatingindex, length(floatingindex) - 100)) 
+aug_dsm <- aug_dsm[-deleteindex,]
+
+aug_dsm$train <- if_else(aug_dsm$train == 1, "Floating Veg.", as.character(aug_dsm$train))
+aug_dsm$train <- if_else(aug_dsm$train == 3, "Sub.Veg.", as.character(aug_dsm$train))
+aug_dsm$train <- if_else(aug_dsm$train == 4, "Emergent Veg.", as.character(aug_dsm$train))
+
+####----new plots with lumped classes----#### 
+aug_prof_features<- reshape2::melt(aug_dsm,id=c("train"),
+                                   measure=c("Green8_5","Red8_5","Red.Edge8_5","NIR8_5","NDVI8_5","DSM8_5","StdVegHeight8_5"))
+names(aug_prof_features)[3] <- "Reflectance"
